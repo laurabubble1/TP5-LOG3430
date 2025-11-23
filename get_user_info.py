@@ -20,9 +20,7 @@ def parse_log_line(line: str) -> Optional[Dict[str, str]]:
         return None
 
     data = match.groupdict()
-    # Normalise l'action vide
     data['action'] = data['action'].strip()
-    # Fournit un nom d'utilisateur synthétique pour les lignes système (optionnel)
     if not data.get('username'):
         data['username'] = 'system'
     return data
@@ -56,7 +54,6 @@ def _normalize_endpoint(path: str) -> str:
         """
         if not path:
                 return path
-        # Remplace tout /<chiffres> par /:id
         return re.sub(r"/(?:\d+)(?=$|/)", "/:id", path)
 
 def analyze_logs(log_file_path: str, include_system: bool = False, build_markov: bool = False, infer_login: bool = False):
@@ -114,11 +111,31 @@ def analyze_logs(log_file_path: str, include_system: bool = False, build_markov:
 
     transitions: Dict[Tuple[str, str], int] = {}
     if build_markov and len(sequence) > 1:
-        # Construit les transitions en ignorant le verbe, se concentrant sur les transitions de chemin d'endpoint
-        for i in range(len(sequence) - 1):
-            src = sequence[i][1]
-            dst = sequence[i+1][1]
-            transitions[(src, dst)] = transitions.get((src, dst), 0) + 1
+        # Construit les transitions par utilisateur pour éviter de mélanger les parcours
+        user_sequences: Dict[str, list] = {}
+        line_idx = 0
+        for raw_line in _iter_decoded_lines(log_file_path):
+            parsed = parse_log_line(raw_line)
+            if not parsed:
+                continue
+            username = parsed['username']
+            if username == 'system' and not include_system:
+                continue
+            verb = parsed['action'].split()[0] if parsed['action'] else 'UNKNOWN'
+            parts = parsed['action'].split()
+            if len(parts) >= 2 and parts[1].startswith('/'):
+                norm_path = _normalize_endpoint(parts[1])
+                user_sequences.setdefault(username, []).append((verb, norm_path))
+            line_idx += 1
+        
+        # Construit les transitions uniquement à l'intérieur de chaque séquence utilisateur
+        for username, user_seq in user_sequences.items():
+            if username == 'anonymous':
+                continue
+            for i in range(len(user_seq) - 1):
+                src = user_seq[i][1]
+                dst = user_seq[i+1][1]
+                transitions[(src, dst)] = transitions.get((src, dst), 0) + 1
 
     # Calcule les probabilités de transition par endpoint source
     transition_probs: Dict[str, Dict[str, float]] = {}
@@ -152,22 +169,27 @@ def print_statistics(stats: Dict[str, Dict], show_markov: bool = False, show_log
 
     # Résumé des endpoints
     if stats.get('endpoints'):
-        print("\nEndpoints (ID-normalized) usage counts:")
-        for ep, cnt in sorted(stats['endpoints'].items(), key=lambda x: x[1], reverse=True)[:15]:
+        print("\nEndpoints nombre d'utilisations:")
+        for ep, cnt in sorted(stats['endpoints'].items(), key=lambda x: x[1], reverse=True):
             print(f"  {ep}: {cnt}")
+        print("\nEndpoints (pourcentage d'utilisation):")
+        total_endpoints = sum(stats['endpoints'].values())
+        for ep, cnt in sorted(stats['endpoints'].items(), key=lambda x: x[1], reverse=True):
+            percent = (cnt / total_endpoints) * 100
+            print(f"  {ep}: {percent:.1f}%")    
     
     if show_markov and stats.get('transition_percentages'):
-        print("\nMarkov chain transition percentages (top 10 per source):")
+        print("\nPourcentages de transition de la chaîne de Markov :")
         for src, dsts in stats['transition_percentages'].items():
             # Trie les destinations par probabilité décroissante
-            top_dsts = sorted(dsts.items(), key=lambda x: x[1], reverse=True)[:10]
+            top_dsts = sorted(dsts.items(), key=lambda x: x[1], reverse=True)
             dst_str = ", ".join(f"{dst}={prob:.1f}%" for dst, prob in top_dsts)
             print(f"  {src} -> {dst_str}")
     if show_login and stats.get('login_attempts'):
-        print("\nLogin attempts summary:")
-        print(f"  Total anonymous login attempts: {stats['login_attempts']}")
-        print(f"  Successful (paired with new user): {stats['login_success']}")
-        print(f"  Failed / unmatched: {stats['login_failed']}")
+        print("\nRésumé des tentatives de connexion:")
+        print(f"  Tentatives de connexion anonymes totales: {stats['login_attempts']}")
+        print(f"  Réussies (appariées avec un nouvel utilisateur): {stats['login_success']}")
+        print(f"  Échouées / non appariées: {stats['login_failed']}")
 
 if __name__ == "__main__":
     import argparse
